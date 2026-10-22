@@ -19,6 +19,8 @@ Invoke deployed agent:
 
 # ── Imports ───────────────────────────────────────────────────────────────────
 # These imports are provided. Do not remove them.
+import math
+
 from strands import Agent, tool
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from bedrock_agentcore.memory import MemoryClient
@@ -40,19 +42,23 @@ from strands_tools.browser import AgentCoreBrowser
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("CSAI_Agent")
 
-# ── TODO 1 — App Initialisation ───────────────────────────────────────────────
-# Create a BedrockAgentCoreApp instance.
-# This registers the ASGI server for AgentCore deployment.
-# There must be exactly one instance per deployment.
-#
-# Hint: app = BedrockAgentCoreApp()
+app = BedrockAgentCoreApp()
 
-# TODO: Create the BedrockAgentCoreApp instance
-app = None  # Replace this line
+
 
 
 # Suppress interactive tool-consent prompts (required in headless deployments).
 os.environ["BYPASS_TOOL_CONSENT"] = "true"
+
+try:
+    import shutil, pathlib, playwright
+    _src = pathlib.Path(playwright.__file__).parent / "driver" / "node"
+    _dst = pathlib.Path("/tmp/pw_node")
+    shutil.copyfile(_src, _dst)
+    os.chmod(_dst, 0o755)
+    os.environ["PLAYWRIGHT_NODEJS_PATH"] = str(_dst)
+except Exception:
+    logger.warning("Could not prepare playwright node", exc_info=True)
 
 
 # ── TODO 2 — Configuration ────────────────────────────────────────────────────
@@ -66,30 +72,24 @@ os.environ["BYPASS_TOOL_CONSENT"] = "true"
 # REGION:     your AWS region, e.g. "us-east-1"
 # MEMORY_ID   format: shown in the AgentCore Memory console
 
-GATEWAY_URL = "<gateway_url>"   # TODO: Replace with your Gateway URL
-KB_ID       = "<kbid>"          # TODO: Replace with your Knowledge Base ID
-REGION      = "<region>"        # TODO: Replace with your AWS region
-MEMORY_ID   = "<mem_id>"        # TODO: Replace with your Memory ID
+GATEWAY_URL = "https://customersupportgateway-ggcrjj0oe9.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"   
+KB_ID       = "ICBUXDGKZB"          
+REGION      = "us-east-1"       
+MEMORY_ID   = "CustomerSupportMemory-DxEGvY7DT0"        
 
 
 # ── TODO 3 — Model and Clients ────────────────────────────────────────────────
-# Create:
-#   1. A BedrockModel using model_id "global.amazon.nova-2-lite-v1:0"
-#   2. A MemoryClient with region_name=REGION
-#   3. A boto3 client for the "bedrock-agent-runtime" service in REGION
-#
-# Hint: model = BedrockModel(model_id=model_id)
-
+# Model and AWS clients
 model_id = "global.amazon.nova-2-lite-v1:0"
+model = BedrockModel(model_id=model_id)
 
-# TODO: Create the BedrockModel instance
-model = None  # Replace this line
+memory_client = MemoryClient(region_name=REGION)
 
-# TODO: Create the MemoryClient instance
-memory_client = None  # Replace this line
+_bedrock_runtime = boto3.client(
+    "bedrock-agent-runtime",
+    region_name=REGION,
+)
 
-# TODO: Create the boto3 bedrock-agent-runtime client
-_bedrock_runtime = None  # Replace this line
 
 
 # ── TODO 4 — Namespace Helper ─────────────────────────────────────────────────
@@ -107,9 +107,21 @@ _bedrock_runtime = None  # Replace this line
 #     "USER_PREFERENCE": "cs_agent/{actorId}/preferences" }
 
 def get_namespaces(mem_client: MemoryClient, memory_id: str) -> Dict:
-    """Return a dict mapping strategy type → namespace template string."""
-    # TODO: Implement this function
-    pass
+    """Return a dict mapping strategy type to namespace template string."""
+    strategies = mem_client.get_memory_strategies(memory_id)
+    namespaces = {}
+
+    for strategy in strategies:
+        strategy_type = strategy.get("type")
+        templates = strategy.get("namespaceTemplates")
+
+        if not templates:
+            templates = strategy.get("namespaces", [])
+
+        if strategy_type and templates:
+            namespaces[strategy_type] = templates[0]
+
+    return namespaces
 
 
 # ── TODO 5 — Memory Hook ──────────────────────────────────────────────────────
@@ -138,6 +150,7 @@ def get_namespaces(mem_client: MemoryClient, memory_id: str) -> Dict:
 #     — register retrieve_customer_context on MessageAddedEvent
 #     — register save_support_interaction on AfterInvocationEvent
 
+
 class MemoryHook(HookProvider):
     """Long-term memory hook for the customer support agent."""
 
@@ -148,37 +161,164 @@ class MemoryHook(HookProvider):
         memory_client: MemoryClient,
         memory_id: str,
     ):
-        # TODO: Store actor_id, session_id, memory_id, memory_client as attributes
-        # TODO: Call get_namespaces() and store the result as self.namespaces
-        pass
+        self.actor_id = actor_id
+        self.session_id = session_id
+        self.memory_client = memory_client
+        self.memory_id = memory_id
+        self.namespaces = get_namespaces(memory_client, memory_id)
+
+    @staticmethod
+    def _text_from_content(content) -> str:
+        """Extract plain text from a Strands message content value."""
+        if isinstance(content, str):
+            return content.strip()
+
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and isinstance(
+                    block.get("text"), str
+                ):
+                    parts.append(block["text"])
+            return "\n".join(parts).strip()
+
+        return ""
 
     def retrieve_customer_context(self, event: MessageAddedEvent):
-        """Retrieve relevant memories and prepend them to the user message."""
-        # TODO: Implement memory retrieval
-        # Steps:
-        #   1. Get the last message from event.agent.messages
-        #   2. Check it is a user message and not a tool result
-        #   3. Extract the user query text
-        #   4. For each namespace in self.namespaces, call retrieve_memories()
-        #   5. Collect non-empty memory texts with strategy type tags
-        #   6. If any found, prepend them to the user message
-        pass
+        """Retrieve relevant memories and prepend them to a user message."""
+        messages = event.agent.messages
+        if not messages:
+            return
+
+        message = messages[-1]
+
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return
+
+        content = message.get("content")
+
+        # Only process plain-text messages, not images or other content.
+        if isinstance(content, list) and any(
+            not isinstance(block, dict)
+            or not isinstance(block.get("text"), str)
+            for block in content
+        ):
+            return
+
+        query = self._text_from_content(content)
+        if not query:
+            return
+        self._original_query = query
+
+        found_memories = []
+
+        for strategy_type, template in self.namespaces.items():
+            namespace = template.replace(
+                "{actorId}", self.actor_id
+            ).replace("{sessionId}", self.session_id)
+
+            try:
+                results = self.memory_client.retrieve_memories(
+                    self.memory_id,
+                    namespace,
+                    query,
+                    top_k=5,
+                )
+
+                for item in results or []:
+                    if not isinstance(item, dict):
+                        continue
+
+                    # Handle common memory response structures.
+                    memory_content = item.get("content", "")
+                    if isinstance(memory_content, dict):
+                        memory_text = memory_content.get("text", "")
+                    elif isinstance(memory_content, str):
+                        memory_text = memory_content
+                    else:
+                        memory_text = ""
+
+                    if not memory_text and isinstance(item.get("memory"), dict):
+                        memory_text = item["memory"].get("content", "")
+
+                    if isinstance(memory_text, str) and memory_text.strip():
+                        found_memories.append(
+                            f"[{strategy_type}] {memory_text.strip()}"
+                        )
+
+            except Exception:
+                logger.exception(
+                    "Memory retrieval failed for strategy %s",
+                    strategy_type,
+                )
+
+        if found_memories:
+            enriched_message = (
+                "Customer Context:\n"
+                + "\n".join(found_memories)
+                + "\n\n"
+                + query
+            )
+
+            if isinstance(content, str):
+                message["content"] = enriched_message
+            else:
+                message["content"] = [{"text": enriched_message}]
 
     def save_support_interaction(self, event: AfterInvocationEvent):
-        """Save the completed turn to memory after the agent responds."""
-        # TODO: Implement memory saving
-        # Steps:
-        #   1. Get messages from event.agent.messages
-        #   2. Walk backwards to find the last user query (plain text)
-        #      and the last assistant response
-        #   3. Call memory_client.create_event() with both messages
-        pass
+        """Save the completed user query and assistant response."""
+        messages = event.agent.messages
 
-    def register_hooks(self, registry: HookRegistry) -> None:  # type: ignore
-        """Register both memory callbacks."""
-        # TODO: Register retrieve_customer_context on MessageAddedEvent
-        # TODO: Register save_support_interaction on AfterInvocationEvent
-        pass
+        customer_query = ""
+        agent_response = ""
+
+        # Walk backwards to find the latest user query and assistant reply.
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+
+            role = message.get("role")
+            text = self._text_from_content(message.get("content"))
+
+            if not text:
+                continue
+
+            if role == "assistant" and not agent_response:
+                agent_response = text
+            elif role == "user" and not customer_query:
+                customer_query = text
+
+            if customer_query and agent_response:
+                break
+
+        if not customer_query or not agent_response:
+            return
+        customer_query = getattr(self, "_original_query", customer_query)
+
+        try:
+            self.memory_client.create_event(
+                memory_id=self.memory_id,
+                actor_id=self.actor_id,
+                session_id=self.session_id,
+                messages=[
+                    (customer_query, "USER"),
+                    (agent_response, "ASSISTANT"),
+                ],
+            )
+        except Exception:
+            logger.exception("Failed to save support interaction to memory")
+
+    def register_hooks(self, registry: HookRegistry):
+        """Register memory retrieval and saving callbacks."""
+        registry.add_callback(
+            MessageAddedEvent,
+            self.retrieve_customer_context,
+        )
+        registry.add_callback(
+            AfterInvocationEvent,
+            self.save_support_interaction,
+        )
+
 
 
 # ── TODO 6 — Knowledge Base Tool ─────────────────────────────────────────────
@@ -204,13 +344,38 @@ def search_knowledge_base(query: str) -> str:
     information, loyalty program details, and order status definitions.
 
     Args:
-        query: The question or topic to search for
-
-    Returns:
-        Relevant information retrieved from the knowledge base
+        query: The question or topic to search for.
     """
-    # TODO: Implement the Knowledge Base search
-    pass
+    if not KB_ID:
+        return "Knowledge base not configured."
+
+    try:
+        response = _bedrock_runtime.retrieve(
+            knowledgeBaseId=KB_ID,
+            retrievalQuery={"text": query},
+        )
+
+        results = response.get("retrievalResults", [])
+
+        if not results:
+            return "No relevant information was found in the knowledge base."
+
+        chunks = []
+        for result in results:
+            content = result.get("content", {})
+            text = content.get("text", "").strip()
+
+            if text:
+                chunks.append(text)
+
+        if not chunks:
+            return "No readable text was found in the knowledge base results."
+
+        return "\n\n".join(chunks)
+
+    except Exception as exc:
+        logger.exception("Knowledge Base retrieval failed")
+        return f"Knowledge Base search failed: {exc}"
 
 
 # ── TODO 7 — Loyalty Discount Tool (Code Interpreter) ────────────────────────
@@ -230,6 +395,7 @@ def search_knowledge_base(query: str) -> str:
 #   4. Include a fallback that computes only the tier discount if the
 #      Code Interpreter is unavailable
 
+
 @tool
 def calculate_loyalty_discount(
     loyalty_points: int,
@@ -238,28 +404,123 @@ def calculate_loyalty_discount(
     product_category: str = "standard",
 ) -> str:
     """
-    Calculate the loyalty discount for a customer order using the
-    AgentCore Code Interpreter. Runs exact arithmetic in a secure sandbox.
+    Calculate a customer's loyalty discount using AgentCore Code Interpreter.
+    Use this tool when calculating points redemption, tier discounts,
+    final prices, savings, or points earned.
 
     Args:
-        loyalty_points:   Customer's current points balance
-        tier:             Customer tier — Silver, Gold, or Platinum
-        order_total:      Order total in USD
-        product_category: standard, device, or fresh
-
-    Returns:
-        Full discount breakdown and final price
+        loyalty_points: Customer's current points balance.
+        tier: Silver, Gold, or Platinum.
+        order_total: Order total in USD.
+        product_category: standard, device, or fresh.
     """
-    # TODO: Build the code string (use an f-string to inject the arguments)
-    code = ""  # Replace with your code string
+    if loyalty_points < 0 or order_total < 0:
+        return "Error: loyalty points and order total cannot be negative."
 
+    # JSON encoding safely embeds the supplied values into the code string.
+    code = f"""
+import json
+import math
+
+loyalty_points = {json.dumps(loyalty_points)}
+tier = {json.dumps(tier)}
+order_total = {json.dumps(order_total)}
+product_category = {json.dumps(product_category)}
+
+earn_rates = {{"standard": 1, "device": 2, "fresh": 5}}
+tier_rates = {{"Silver": 0.00, "Gold": 0.10, "Platinum": 0.15}}
+
+tier_discount_pct = tier_rates.get(tier.title(), 0.00)
+earn_rate = earn_rates.get(product_category.lower(), 1)
+
+# Redeem points in blocks of 500, with a maximum redemption
+# value equal to 50% of the original order total.
+redeemable_points = (loyalty_points // 500) * 500
+max_redemption_value = order_total * 0.50
+
+# Assumption: 100 points have a redemption value of $1.
+points_redeemed = min(
+    redeemable_points,
+    math.floor(max_redemption_value * 100 / 500) * 500
+)
+points_value = points_redeemed / 100
+
+subtotal_after_points = max(0.0, order_total - points_value)
+tier_discount = subtotal_after_points * tier_discount_pct
+final_total = max(0.0, subtotal_after_points - tier_discount)
+total_savings = order_total - final_total
+
+points_earned = math.floor(final_total * earn_rate)
+remaining_points = loyalty_points - points_redeemed + points_earned
+
+print(json.dumps({{
+    "points_redeemed": points_redeemed,
+    "points_value": round(points_value, 2),
+    "tier_discount_pct": round(tier_discount_pct * 100, 2),
+    "tier_discount": round(tier_discount, 2),
+    "final_total": round(final_total, 2),
+    "total_savings": round(total_savings, 2),
+    "points_earned": points_earned,
+    "remaining_points": remaining_points
+}}))
+"""
+  
     try:
-        # TODO: Execute the code using code_session and return the result
-        pass
+        with code_session(REGION) as code_client:
+            response = code_client.invoke(
+                "executeCode",
+                {
+                    "code": code,
+                    "language": "python",
+                    "clearContext": True,
+                },
+            )
 
-    except Exception as e:
-        # TODO: Implement fallback calculation using tier discount only
-        pass
+            for event in response["stream"]:
+                result = event.get("result")
+                if result is not None:
+                    return json.dumps(result) if isinstance(
+                        result, (dict, list)
+                    ) else str(result)
+
+        raise RuntimeError(
+            "Code Interpreter returned no result event."
+        )
+
+    except Exception:
+        logger.exception(
+            "Code Interpreter unavailable; using fallback."
+        )
+
+        tier_rates = {
+            "Silver": 0.00,
+            "Gold": 0.10,
+            "Platinum": 0.15,
+        }
+        tier_discount_pct = tier_rates.get(tier.title(), 0.00)
+        tier_discount = order_total * tier_discount_pct
+        final_total = max(0.0, order_total - tier_discount)
+
+        return json.dumps({
+            "fallback": True,
+            "points_redeemed": 0,
+            "tier_discount_pct": round(
+                tier_discount_pct * 100, 2
+            ),
+            "final_total": round(final_total, 2),
+            "total_savings": round(
+                order_total - final_total, 2
+            ),
+            "points_earned": math.floor(
+                final_total * {
+                    "standard": 1,
+                    "device": 2,
+                    "fresh": 5,
+                }.get(product_category.lower(), 1)
+            ),
+            "remaining_points": loyalty_points,
+        })
+
 
 
 # ── TODO 8 — Agent Entrypoint ─────────────────────────────────────────────────
@@ -278,17 +539,74 @@ def calculate_loyalty_discount(
 #   8. Handle exceptions gracefully
 
 @app.entrypoint
-async def invoke(payload, context=None):
-    """
-    Main handler called by AgentCore for every incoming request.
+def invoke(payload, context=None):
+    """Handle one customer-support request."""
+    try:
+        user_input = payload.get("prompt", "").strip()
+        if not user_input:
+            return "Please provide a customer-support question in 'prompt'."
 
-    Expected payload keys:
-      prompt      (str, required) — the customer's message
-      customer_id (str, optional) — unique customer identifier
-      session_id  (str, optional) — session identifier; generated if absent
-    """
-    # TODO: Implement the agent invocation
-    pass
+        actor_id = payload.get("customer_id") or "anonymous"
+        session_id = payload.get("session_id") or str(uuid.uuid4())
+
+        memory_hook = MemoryHook(
+            actor_id=actor_id,
+            session_id=session_id,
+            memory_client=memory_client,
+            memory_id=MEMORY_ID,
+        )
+
+        agent_core_browser = AgentCoreBrowser(region=REGION)
+
+        tools = [
+            search_knowledge_base,
+            calculate_loyalty_discount,
+            agent_core_browser.browser,
+        ]
+
+        gateway_client = MCPClient(
+            lambda: streamable_http_client(GATEWAY_URL)
+        )
+
+        with gateway_client:
+            gateway_tools = gateway_client.list_tools_sync()
+            tools.extend(gateway_tools)
+
+            system_prompt = """
+            You are a helpful customer-support AI agent.
+
+            Help customers with orders, refunds, returns, and loyalty rewards.
+            Use the knowledge-base tool for company policies and product information.
+            Use Gateway tools for customer and order information and refund operations.
+            Use the browser when live web information is needed.
+            Use the loyalty calculator for discount calculations.
+            Use relevant customer memories to personalize responses.
+            Never invent order details, refund statuses, or company policies.
+            If a tool fails, explain the limitation clearly.
+            Be polite, concise, and accurate.
+            """
+
+            agent = Agent(
+                model=model,
+                tools=tools,
+                hooks=[memory_hook],
+                system_prompt=system_prompt,
+            )
+            response = agent(user_input)
+
+
+        content = response.get("content", []) if isinstance(response, dict) else []
+
+        if content:
+            first_block = content[0]
+            if isinstance(first_block, dict):
+                return first_block.get("text", str(first_block))
+
+        return str(response)
+
+    except Exception:
+        logger.exception("Agent invocation failed")
+        return "Sorry, I couldn't complete your request because of a technical issue. Please try again."
 
 
 # ── CLI entry point (do not modify) ──────────────────────────────────────────
@@ -297,11 +615,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("payload", type=str)
     args = parser.parse_args()
-    response = asyncio.run(invoke(json.loads(args.payload)))
+    response = invoke(json.loads(args.payload))
     print(response)
 
 
 if __name__ == "__main__":
     app.run()
-    # Uncomment the line below and comment app.run() for local CLI testing:
+    
     # main()

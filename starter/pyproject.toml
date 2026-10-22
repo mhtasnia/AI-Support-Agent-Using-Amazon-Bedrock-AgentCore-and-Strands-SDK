@@ -15,4 +15,7 @@ dependencies = [
     "strands-agents>=1.28.0",
     "strands-agents-tools>=0.2.21",
     "urllib3>=2.6.3",
+    "opentelemetry-instrumentation>=0.66b1",
+    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-exporter-otlp>=1.45.1",
 ]
